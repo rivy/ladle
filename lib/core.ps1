@@ -2,6 +2,8 @@ $scoopdir = $env:SCOOP, "~\appdata\local\scoop" | select -first 1
 $globaldir = $env:SCOOP_GLOBAL, "$($env:programdata.tolower())\scoop" | select -first 1
 $cachedir = "$scoopdir\cache" # always local
 
+$envpipe = $env:SCOOP_ENVPIPE
+
 # helper functions
 function coalesce($a, $b) { if($a) { return $a } $b }
 function format($str, $hash) {
@@ -79,7 +81,13 @@ function env { param($name,$value,$targetEnvironment)
         }
     else { $targetEnvironment = [System.EnvironmentVariableTarget]::Process }
 
-	if($PSBoundParameters.ContainsKey('value')) { [environment]::setEnvironmentVariable($name,$value,$targetEnvironment) }
+	if($PSBoundParameters.ContainsKey('value')) {
+        [environment]::setEnvironmentVariable($name,$value,$targetEnvironment)
+        if (($targetEnvironment -eq 'Process') -and ($envpipe -ne $null))
+            {
+                "set " + ( CMD_SET_encode("$name=$value") ) | out-file -encoding oem $envpipe -append
+            }
+        }
 	else { [environment]::getEnvironmentVariable($name,$targetEnvironment) }
 }
 function unzip($path,$to) {
@@ -155,6 +163,136 @@ function shim($path, $global, $name, $arg) {
 		$shim_cmd = "$(strip_ext($shim)).cmd"
 		"@powershell -noprofile -ex unrestricted `"& '$(resolve-path $path)' %*;exit `$lastexitcode`"" | out-file $shim_cmd -encoding oem
 	}
+}
+
+# ToDO: better names for "shim_scoop" and "shim_scoop_CMD_code"
+function shim_scoop($path, $global) {
+    # special handling is needed for updating in-progress BAT/CMD files to avoid unanticipated execution paths (with possible errors)
+    # must assume that the CMD shim may be currently in-use (since there is no simple way to determine that condition)
+
+    # save initial CMD shim length
+    $CMD_shim_fullpath = resolve-path "$(shimdir $false)\scoop.cmd"     # resolve path into CMD/DOS compatible format
+    $CMD_shim_content = Get-Content $CMD_shim_fullpath
+    $CMD_shim_original_length = (Get-ChildItem $CMD_shim_fullpath).length
+
+    # create the usual shims pointing to scoop
+    shim $path $global
+
+    # the scoop CMD shim is special
+    # the CMD shim is created de-novo with special handling for in-progress updates and to add environment piping back up to the original calling CMD process
+
+    # assume that the current CMD shim is either:
+    # 1. old version == calls powershell with the last command in the script
+    #    .... since the execution thread/process (ToDO: better word needed) returns to the script (executing from the character position at the end of the command calling scoop),
+    #    .... special handling is needed
+    #    .... we can use the fact the prior shims were all constructed to call scoop with the last command in the script to build a script which allows the usual return and completion of the current process without error *and* executes subsequent runs correctly
+    #    .... To do this, we must embed code for future execution paths within the space before the point at which execution returns (which we assume is the end of the script) and then fill the script so that the current process returns to a known execution path and finishes correctly
+    # ... or
+    # 2. new self-update aware script which executes via a proxy allowing modification without limitation (tested via embedded signal text: "*(scoop:#self-update-ok)"). NOTE: the * is included because it's illegal in a filename making it's inclusion in some shim incarnation even less likely.
+
+    $signal_text = '*(scoop:#self-update-ok)'
+
+    "@::$signal_text" | out-file $CMD_shim_fullpath -encoding OEM
+
+    # if $CMD_shim_content contains $signal_text there is no need to add the code in this section
+    # * using this stops the otherwise exponential growth of the CMD shim due to the needed addition of null-execution buffer code for unprepared/unrecognized CMD shims
+    if (-not ($CMD_shim_content -match [regex]::Escape($signal_text))) {
+        "@goto :__START__" | out-file $CMD_shim_fullpath -append -encoding OEM
+        # buffer the hand-off code with code which safely deals with the prior shim design which has a silent return from scoop.ps1, continuing execution (though to EOF, which exits the script); any code placed following the character position at EOF in the prior shim must finish normally without error
+        $size = $CMD_shim_original_length - (Get-ChildItem $CMD_shim_fullpath).length
+        if ($size -lt 0) {
+            # ToDO: refactor this out of the function as $args_initial is in the scoop-update.ps1 file (although in-scope here, it's confusing); but the simple course of returning a bool error flag may be the best course either
+            # updater hand-off code was longer than the initial shim which could lead to an error, request re-update
+            $reupdate_command = 'scoop update'
+            if ($args_initial) { $reupdate_command += " $args_initial" }
+            warn "scoop encountered an update inconsistency, please re-run '$reupdate_command'"
+            $size = 0
+            }
+        $repeat = $size - 2
+        if ( $repeat -lt 0 ) { $repeat = 0 }
+        $("::" + (":" * $repeat)) | out-file $CMD_shim_fullpath -append -encoding OEM
+        "@goto :EOF" | out-file $CMD_shim_fullpath -append -encoding OEM
+        "@:__START__" | out-file $CMD_shim_fullpath -append -encoding OEM
+        }
+    $code = shim_scoop_CMD_code $(resolve-path $path)
+    $code | out-file $CMD_shim_fullpath -append -encoding OEM
+}
+
+function shim_scoop_CMD_code($path) {
+$retVAL = '
+@setlocal
+@echo off
+set __ME=%~n0
+set __dp0=%~dp0
+
+:: NOTE: an extra level of execution indirection is used by creating of an out-of-source execution proxy BAT/CMD file to allow for safe self-modification
+
+:: require temporary files
+:: * (needed for both out-of-source execution and for sourcing in-process environment variable updates)
+call :_tempfile __oosource "%__ME%.oosource" ".bat"
+if NOT DEFINED __oosource ( goto :TEMPFILE_ERROR )
+call :_tempfile __pipe "%__ME%.pipe" ".bat"
+if NOT DEFINED __pipe ( goto :TEMPFILE_ERROR )
+goto :TEMPFILES_FOUND
+:TEMPFILES_ERROR
+echo %__ME%: ERROR: unable to open needed temporary file(s) [make sure to set TEMP or TMP to an available writable temporary directory {try "set TEMP=%%LOCALAPPDATA%%\Temp"}] 1>&2
+exit /b -1
+:TEMPFILES_FOUND
+
+echo @:: TEMPORARY source/exec environment pipe file [owner: "%~nx0"] > "%__pipe%"
+
+echo @:: TEMPORARY out-of-source executable proxy [owner: "%~nx0"] > "%__oosource%"
+echo (set ERRORLEVEL=) >> "%__oosource%"
+echo setlocal >> "%__oosource%"
+'
+$retval += "
+echo call powershell -NoProfile -ExecutionPolicy unrestricted -Command ^`"^& '$path' -__cmdenvpipe '%__pipe%' %*^`" >> `"%__oosource%`"
+"
+$retval += '
+echo (set __exit_code=%%ERRORLEVEL%%) >> "%__oosource%"
+echo ^( endlocal >> "%__oosource%"
+echo call ^"%__pipe%^"  >> "%__oosource%"
+echo call erase /q ^"%__pipe%^" ^>NUL 2^>NUL >> "%__oosource%"
+echo start ^"^" /b cmd /c del ^"%%~f0^" ^& exit /b %%__exit_code%% >> "%__oosource%"
+echo ^) >> "%__oosource%"
+
+endlocal & "%__oosource%" &:: intentional non-call (no-return from proxy) to allow for safe self-updates
+
+goto :EOF
+
+::#### SUBs
+
+::
+:_tempfile ( ref_RETURN [PREFIX [EXTENSION]])
+:: open a unique temporary file
+:: RETURN == full pathname of temporary file (with given PREFIX and EXTENSION) [NOTE: has NO surrounding quotes]
+:: PREFIX == optional filename prefix for temporary file
+:: EXTENSION == optional extension (including leading ".") for temporary file [default == ".bat"]
+setlocal
+set "_RETval="
+set "_RETvar=%~1"
+set "prefix=%~2"
+set "extension=%~3"
+if NOT DEFINED extension ( set "extension=.bat")
+:: find a temp directory (respect prior setup; default to creating/using "%LocalAppData%\Temp" as a last resort)
+if NOT EXIST "%temp%" ( set "temp=%tmp%" )
+if NOT EXIST "%temp%" ( mkdir "%LocalAppData%\Temp" 2>NUL & cd . & set "temp=%LocalAppData%\Temp" )
+if NOT EXIST "%temp%" ( goto :_tempfile_RETURN )    &:: undefined TEMP, RETURN (with NULL result)
+:: NOTE: this find unique/instantiate loop has an unavoidable race condition (but, as currently coded, the real risk of collision is virtually nil)
+:_tempfile_find_unique_temp
+set "_RETval=%temp%\%prefix%.%RANDOM%.%RANDOM%%extension%" &:: arbitrarily lower risk can be obtained by increasing the number of %RANDOM% entries in the file name
+if EXIST "%_RETval%" ( goto :_tempfile_find_unique_temp )
+:: instantiate tempfile
+set /p OUTPUT=<nul >"%_RETval%"
+:_tempfile_find_unique_temp_DONE
+:_tempfile_RETURN
+endlocal & set %_RETvar%^=%_RETval%
+goto :EOF
+::
+
+goto :EOF
+'
+$retVAL
 }
 
 function ensure_in_path($dir, $global) {
@@ -266,3 +404,23 @@ function reset_aliases() {
 	# set default aliases
 	$default_aliases.keys | % { reset_alias $_ $default_aliases[$_] }
 }
+
+function CMD_SET_encode {
+    # CMD_SET_encode( @ )
+    # encode string(s) to equivalent CMD command line interpretable version(s) for SET
+    if ($args -ne $null) {
+        $args | ForEach-Object {
+            $val = $_
+            $val = $($val -replace '\^','^^')
+            $val = $($val -replace '\(','^(')
+            $val = $($val -replace '\)','^)')
+            $val = $($val -replace '<','^<')
+            $val = $($val -replace '>','^>')
+            $val = $($val -replace '\|','^|')
+            $val = $($val -replace '&','^&')
+            $val = $($val -replace '"','^"')
+            $val = $($val -replace '%','^%')
+            $val
+            }
+        }
+    }
