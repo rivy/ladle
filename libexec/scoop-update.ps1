@@ -22,6 +22,8 @@
 
 reset_aliases
 
+# $args_initial = $args   # ToDO: refactor shim_scoop not use this variable and use it within this code directly instead
+
 $opt, $apps, $err = getopt $args 'gfkq' 'global','force', 'no-cache', 'quiet'
 if($err) { "scoop update: $err"; exit 1 }
 $global = $opt.g -or $opt.global
@@ -62,8 +64,9 @@ function update_scoop() {
 		popd
 	}
 
-	ensure_scoop_in_path
-	shim "$currentdir\bin\scoop.ps1" $false
+    ensure_scoop_in_path $false
+    # shim "$currentdir\bin\scoop.ps1" $false
+    shim_scoop "$currentdir\bin\scoop.PS1" $false
 
 	@(buckets) | % {
 		"updating $_ bucket..."

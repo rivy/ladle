@@ -1,10 +1,16 @@
 #requires -v 3
-param($cmd)
+param(
+    [parameter(mandatory=$false)][string] $__CMDenvpipe = $null,
+    [parameter(mandatory=$false,position=0)] $cmd,
+    [parameter(ValueFromRemainingArguments=$true)][array] $args = @()
+    )
 
 set-strictmode -off
 
 . "$psscriptroot\..\lib\core.ps1"
 . (relpath '..\lib\commands')
+
+$env:SCOOP_ENVPIPE = $__CMDenvpipe
 
 reset_aliases
 
