@@ -62,8 +62,8 @@ function update_scoop() {
 		popd
 	}
 
-	ensure_scoop_in_path
-	shim "$currentdir\bin\scoop.ps1" $false
+    ensure_scoop_in_path $false
+    shim "$currentdir\bin\scoop.ps1" $false
 
 	@(buckets) | % {
 		"updating $_ bucket..."
