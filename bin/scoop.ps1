@@ -1,6 +1,7 @@
 #requires -v 3
 param(
     [parameter(mandatory=$false)][switch] $__updateRestart = $false,
+    [parameter(mandatory=$false)][string] $__CMDenvpipe = $null,
     [parameter(mandatory=$false,position=0)] $__cmd,
     [parameter(ValueFromRemainingArguments=$true)][array] $__args = @()
     )
@@ -11,6 +12,7 @@ set-strictmode -off
 . (relpath '..\lib\commands')
 
 $env:SCOOP__updateRestart = if ( $__updateRestart ) { 'true' } else { '' }
+$env:SCOOP__CMDenvpipe = $__CMDenvpipe
 
 reset_aliases
 

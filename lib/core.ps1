@@ -2,6 +2,8 @@ $scoopdir = $env:SCOOP, "~\appdata\local\scoop" | select -first 1
 $globaldir = $env:SCOOP_GLOBAL, "$($env:programdata.tolower())\scoop" | select -first 1
 $cachedir = "$scoopdir\cache" # always local
 
+$CMDenvpipe = $env:SCOOP__CMDenvpipe
+
 # helper functions
 function coalesce($a, $b) { if($a) { return $a } $b }
 function format($str, $hash) {
@@ -63,10 +65,32 @@ function dl($url,$to) {
     $wc.downloadFile($url,$to)
 
 }
-function env($name,$global,$val='__get') {
-    $target = 'User'; if($global) {$target = 'Machine'}
-    if($val -eq '__get') { [environment]::getEnvironmentVariable($name,$target) }
-    else { [environment]::setEnvironmentVariable($name,$val,$target) }
+function env { param($name,$value,$targetEnvironment)
+    if ( $PSBoundParameters.ContainsKey('targetEnvironment') ) {
+        # $targetEnvironment is expected to be $null, [bool], [string], or [System.EnvironmentVariableTarget]
+        if ($targetEnvironment -eq $null) { $targetEnvironment = [System.EnvironmentVariableTarget]::Process }
+        elseif ($targetEnvironment -is [bool]) {
+            # from initial usage pattern
+            if ($targetEnvironment) { $targetEnvironment = [System.EnvironmentVariableTarget]::Machine }
+            else { $targetEnvironment = [System.EnvironmentVariableTarget]::User }
+        }
+        elseif (($targetEnvironment -eq '') -or ($targetEnvironment -eq 'Process') -or ($targetEnvironment -eq 'Session')) { $targetEnvironment = [System.EnvironmentVariableTarget]::Process }
+        elseif ($targetEnvironment -eq 'User') { $targetEnvironment = [System.EnvironmentVariableTarget]::User }
+        elseif (($targetEnvironment -eq 'Global') -or ($targetEnvironment -eq 'Machine')) { $targetEnvironment = [System.EnvironmentVariableTarget]::Machine }
+        elseif ($targetEnvironment -is [System.EnvironmentVariableTarget]) { <# NoOP #> }
+        else {
+            throw "ERROR: logic: incorrect targetEnvironment parameter ('$targetEnvironment') used for env()"
+        }
+    }
+    else { $targetEnvironment = [System.EnvironmentVariableTarget]::Process }
+
+    if($PSBoundParameters.ContainsKey('value')) {
+        [environment]::setEnvironmentVariable($name,$value,$targetEnvironment)
+        if (($targetEnvironment -eq [System.EnvironmentVariableTarget]::Process) -and ($CMDenvpipe -ne $null)) {
+            "set " + ( CMD_SET_encode_arg("$name=$value") ) | out-file $CMDenvpipe -encoding OEM -append
+        }
+    }
+    else { [environment]::getEnvironmentVariable($name,$targetEnvironment) }
 }
 function unzip($path,$to) {
     if(!(test-path $path)) { abort "can't find $path to unzip"}
@@ -157,6 +181,7 @@ function shim($path, $global, $name, $arg) {
 function shim_scoop_cmd_code($shim_cmd_path, $path, $arg) {
     # specialized code for the scoop CMD shim
     # * special handling is needed for in-progress updates
+    # * additional code needed to pipe environment variables back up and into to the original calling CMD process (see shim_scoop_cmd_code_body())
 
     $CMD_shim_fullpath = resolve-path $shim_cmd_path
     $CMD_shim_content = Get-Content $CMD_shim_fullpath
@@ -195,21 +220,111 @@ function shim_scoop_cmd_code($shim_cmd_path, $path, $arg) {
         $code += '@:__START__' + "`r`n"
     }
 
-    # body code ## handles update-enabled scoop call
-    $code += '@set "ERRORLEVEL="' + "`r`n"
-    $code += "@powershell -noprofile -ex unrestricted `"& '$(resolve-path $path)' $arg %*; exit `$lastexitcode`" & exit /b ^%%ERRORLEVEL^%%`r`n"
+    # body code ## handles update-enabled scoop call and the environment variable pipe
+    $code += shim_scoop_cmd_code_body $(resolve-path $path) $arg
 
     $code
 }
 
+function shim_scoop_cmd_code_body($path, $arg) {
+# shim startup / initialization code
+$code = '
+@set "ERRORLEVEL="
+@setlocal
+@echo off
+set __ME=%~n0
+
+:: NOTE: flow of control is passed (with *no return*) from this script to a proxy BAT/CMD script; any modification of this script is safe at any execution time after that control hand-off
+
+:: require temporary files
+:: * (needed for both out-of-source proxy contruction and for piping in-process environment variable updates)
+call :_tempfile __oosource "%__ME%.oosource" ".bat"
+if NOT DEFINED __oosource ( goto :TEMPFILE_ERROR )
+call :_tempfile __pipe "%__ME%.pipe" ".bat"
+if NOT DEFINED __pipe ( goto :TEMPFILE_ERROR )
+goto :TEMPFILES_FOUND
+:TEMPFILES_ERROR
+echo %__ME%: ERROR: unable to open needed temporary file(s) [make sure to set TEMP or TMP to an available writable temporary directory {try "set TEMP=%%LOCALAPPDATA%%\Temp"}] 1>&2
+exit /b -1
+:TEMPFILES_FOUND
+'
+# shim code initializing environment pipe
+$code += '
+@::* initialize environment pipe
+echo @:: TEMPORARY source/exec environment pipe [owner: "%~f0"] > "%__pipe%"
+'
+# shim code initializing proxy
+$code += '
+@::* initialize out-of-source proxy and add proxy initialization code
+echo @:: TEMPORARY out-of-source executable proxy [owner: "%~f0"] > "%__oosource%"
+echo (set ERRORLEVEL=) >> "%__oosource%"
+echo setlocal >> "%__oosource%"
+'
+# shim code adding scoop call to proxy
+$code += "
+@::* out-of-source proxy code to call scoop
+echo call powershell -NoProfile -ExecutionPolicy unrestricted -Command ^`"^& '$path' -__CMDenvpipe '%__pipe%' $arg %*^`" >> `"%__oosource%`"
+"
+# shim code adding piping of environment changes and cleanup/exit to proxy
+$code += '
+@::* out-of-source proxy code to source environment changes and cleanup
+echo (set __exit_code=%%ERRORLEVEL%%) >> "%__oosource%"
+echo ^( endlocal >> "%__oosource%"
+echo call ^"%__pipe%^"  >> "%__oosource%"
+echo call erase /q ^"%__pipe%^" ^>NUL 2^>NUL >> "%__oosource%"
+echo start ^"^" /b cmd /c del ^"%%~f0^" ^& exit /b %%__exit_code%% >> "%__oosource%"
+echo ^) >> "%__oosource%"
+'
+# shim code to hand-off execution to the proxy (makes this shim "update-enabled")
+$code += '
+endlocal & "%__oosource%" &:: hand-off to proxy; intentional non-call (no return from proxy) to allow for safe updates of this script
+'
+# shim script subroutines
+$code += '
+goto :EOF
+::#### SUBs
+
+::
+:_tempfile ( ref_RETURN [PREFIX [EXTENSION]])
+:: open a unique temporary file
+:: RETURN == full pathname of temporary file (with given PREFIX and EXTENSION) [NOTE: has NO surrounding quotes]
+:: PREFIX == optional filename prefix for temporary file
+:: EXTENSION == optional extension (including leading ".") for temporary file [default == ".bat"]
+setlocal
+set "_RETval="
+set "_RETvar=%~1"
+set "prefix=%~2"
+set "extension=%~3"
+if NOT DEFINED extension ( set "extension=.bat")
+:: find a temp directory (respect prior setup; default to creating/using "%LocalAppData%\Temp" as a last resort)
+if NOT EXIST "%temp%" ( set "temp=%tmp%" )
+if NOT EXIST "%temp%" ( mkdir "%LocalAppData%\Temp" 2>NUL & cd . & set "temp=%LocalAppData%\Temp" )
+if NOT EXIST "%temp%" ( goto :_tempfile_RETURN )    &:: undefined TEMP, RETURN (with NULL result)
+:: NOTE: this find unique/instantiate loop has an unavoidable race condition (but, as currently coded, the real risk of collision is virtually nil)
+:_tempfile_find_unique_temp
+set "_RETval=%temp%\%prefix%.%RANDOM%.%RANDOM%%extension%" &:: arbitrarily lower risk can be obtained by increasing the number of %RANDOM% entries in the file name
+if EXIST "%_RETval%" ( goto :_tempfile_find_unique_temp )
+:: instantiate tempfile
+set /p OUTPUT=<nul >"%_RETval%"
+:_tempfile_find_unique_temp_DONE
+:_tempfile_RETURN
+endlocal & set %_RETvar%^=%_RETval%
+goto :EOF
+::
+
+goto :EOF
+'
+$code
+}
+
 function ensure_in_path($dir, $global) {
-    $path = env 'path' $global
+    $path = env 'path' -t $global
     $dir = fullpath $dir
     if($path -notmatch [regex]::escape($dir)) {
         echo "adding $(friendly_path $dir) to $(if($global){'global'}else{'your'}) path"
 
-        env 'path' $global "$dir;$path" # for future sessions...
-        $env:path = "$dir;$env:path" # for this session
+        env 'path' -t $global "$dir;$path" # for future sessions...
+        env 'path' "$dir;$env:path"        # for this session
     }
 }
 
@@ -222,15 +337,15 @@ function remove_from_path($dir,$global) {
     $dir = fullpath $dir
 
     # future sessions
-    $was_in_path, $newpath = strip_path (env 'path' $global) $dir
+    $was_in_path, $newpath = strip_path (env 'path' -t $global) $dir
     if($was_in_path) {
         echo "removing $(friendly_path $dir) from your path"
-        env 'path' $global $newpath
+        env 'path' -t $global $newpath
     }
 
     # current session
     $was_in_path, $newpath = strip_path $env:path $dir
-    if($was_in_path) { $env:path = $newpath }
+    if($was_in_path) { env 'path' $newpath }
 }
 
 function ensure_scoop_in_path($global) {
@@ -311,3 +426,23 @@ function reset_aliases() {
     # set default aliases
     $default_aliases.keys | % { reset_alias $_ $default_aliases[$_] }
 }
+
+function CMD_SET_encode_arg {
+    # CMD_SET_encode_arg( @ )
+    # encode string(s) to equivalent CMD command line interpretable version(s) as arguments for SET
+    if ($args -ne $null) {
+        $args | ForEach-Object {
+            $val = $_
+            $val = $($val -replace '\^','^^')
+            $val = $($val -replace '\(','^(')
+            $val = $($val -replace '\)','^)')
+            $val = $($val -replace '<','^<')
+            $val = $($val -replace '>','^>')
+            $val = $($val -replace '\|','^|')
+            $val = $($val -replace '&','^&')
+            $val = $($val -replace '"','^"')
+            $val = $($val -replace '%','^%')
+            $val
+            }
+        }
+    }
