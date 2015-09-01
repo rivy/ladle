@@ -70,10 +70,6 @@ function update_scoop() {
 		git pull -q
 		popd
 	}
-
-	ensure_scoop_in_path
-	shim "$currentdir\bin\scoop.ps1" $false
-
     [byte[]] $code_bytes = @();
     foreach ($path in $update_code_paths) { $code_bytes += [System.IO.File]::ReadAllBytes($path) }
     $hash_new = [System.BitConverter]::ToString($md5.ComputeHash($code_bytes))
@@ -84,10 +80,13 @@ function update_scoop() {
         }
         else {
             write-host "scoop update code was changed, restarting update..."
-            scoop update -__updateRestart $($update_restart + 1) $args_initial
+            & "$psscriptroot\..\bin\scoop.ps1" update -__updateRestart $($update_restart + 1) $args_initial
             exit $lastExitCode
         }
     }
+
+    ensure_scoop_in_path
+    shim "$currentdir\bin\scoop.ps1" $false
 
 	@(buckets) | % {
 		"updating $_ bucket..."
